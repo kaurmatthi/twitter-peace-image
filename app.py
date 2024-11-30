@@ -1,12 +1,19 @@
 import json
-
-import requests
-from flask import Flask, redirect, url_for, session, request, render_template, jsonify, flash
-from requests_oauthlib import OAuth1Session
 import os
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
+import requests
+from flask import Flask, redirect, url_for, session, request, render_template, jsonify
+from flask_cors import CORS
+from requests_oauthlib import OAuth1Session
+import jwt
 
 app = Flask(__name__)
+CORS(app, origins=["http://localhost:5173"], supports_credentials=True, methods=["GET", "POST", "OPTIONS"])
 app.secret_key = 'your_secret_key'
+JWT_SECRET = "your_jwt_secret_key"
+JWT_ALGORITHM = "HS256"
+TWEETS_FILE = 'tweets.json'
 
 # Twitter API credentials for OAuth 1.0
 CONSUMER_KEY = ''
@@ -23,7 +30,7 @@ def home():
 @app.route('/twitter-image/login')
 def login():
     # Step 1: Obtain a request token
-    oauth = OAuth1Session(CONSUMER_KEY, client_secret=CONSUMER_SECRET, callback_uri='http://myapp.local:5000/twitter-image/callback')
+    oauth = OAuth1Session(CONSUMER_KEY, client_secret=CONSUMER_SECRET, callback_uri='http://127.0.0.1:5000/twitter-image/callback')
     fetch_response = oauth.fetch_request_token(REQUEST_TOKEN_URL)
     session['oauth_token'] = fetch_response.get('oauth_token')
     session['oauth_token_secret'] = fetch_response.get('oauth_token_secret')
@@ -37,116 +44,135 @@ def logout():
     session.clear()
     return redirect(url_for('home'))
 
+
 @app.route('/twitter-image/callback')
 def callback():
-    # Retrieve the request token and verifier from the callback URL
-    oauth_token = request.args.get('oauth_token')
-    oauth_verifier = request.args.get('oauth_verifier')
-
-    # Step 3: Obtain the access token using the verifier
     oauth = OAuth1Session(
         CONSUMER_KEY,
         client_secret=CONSUMER_SECRET,
         resource_owner_key=session.get('oauth_token'),
         resource_owner_secret=session.get('oauth_token_secret'),
-        verifier=oauth_verifier
+        verifier=request.args.get('oauth_verifier')
     )
-    oauth_tokens = oauth.fetch_access_token(ACCESS_TOKEN_URL)
-    session['oauth_token'] = oauth_tokens.get('oauth_token')
-    session['oauth_token_secret'] = oauth_tokens.get('oauth_token_secret')
+    tokens = oauth.fetch_access_token(ACCESS_TOKEN_URL)
 
-    return redirect(url_for('home'))
+    # Generate JWT with OAuth tokens
+    jwt_payload = {
+        "oauth_token": tokens.get("oauth_token"),
+        "oauth_token_secret": tokens.get("oauth_token_secret"),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=1)  # Token expires in 1 hour
+    }
+    jwt_token = jwt.encode(jwt_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    # Redirect to frontend with authToken
+    frontend_redirect_url = f"http://localhost:5173/?authToken={jwt_token}"
+    return redirect(frontend_redirect_url)
+
+
+@app.route('/twitter-image/generate_image', methods=['POST'])
+def generate_image():
+    try:
+        auth_header = request.headers.get("Authorization")
+        validate_jwt(auth_header)
+
+        request_data = request.get_json()
+        prompt = request_data.get("prompt")
+        if not prompt:
+            return jsonify({"error": "Prompt is required"}), 400
+        
+        # TODO: Replace mock_image_url with DALL-E generated image
+        mock_image_url = "https://www.voicesofyouth.org/sites/voy/files/images/2021-09/voices_of_the_youth_images_0.jpg"
+
+        return jsonify({"imageUrl": mock_image_url}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 
 @app.route('/twitter-image/post_image_tweet', methods=['POST'])
 def post_image_tweet():
-    if 'oauth_token' not in session or 'oauth_token_secret' not in session:
-        return jsonify({"error": "User not authenticated"}), 403
+    # Step 1: Validate JWT
+    auth_header = request.headers.get("Authorization")
+    oauth_token, oauth_token_secret = validate_jwt(auth_header)
 
-    # Set up OAuth session with access token
+    # Step 2: Parse request data
+    request_data = request.get_json()
+    image_url = request_data.get("imageUrl")
+    tweet_text = "This is a test tweet!"  # TODO: Maybe let's include user's prompt?
+    if not image_url:
+        return jsonify({"error": "imageUrl is required"}), 400
+
+    # Step 3: Upload the image to Twitter
     oauth = OAuth1Session(
-        CONSUMER_KEY,
-        client_secret=CONSUMER_SECRET,
-        resource_owner_key=session['oauth_token'],
-        resource_owner_secret=session['oauth_token_secret']
+        CONSUMER_KEY, client_secret=CONSUMER_SECRET,
+        resource_owner_key=oauth_token, resource_owner_secret=oauth_token_secret
     )
+    upload_response = oauth.post(
+        "https://upload.twitter.com/1.1/media/upload.json",
+        files={"media": download_image(image_url)}
+    )
+    if upload_response.status_code != 200:
+        return jsonify({"error": "Failed to upload media", "details": upload_response.json()}), 400
 
-    # Step 1: Upload media
-    image_file = request.files['image']
-    files = {'media': image_file}
-    upload_response = oauth.post("https://upload.twitter.com/1.1/media/upload.json", files=files)
-    upload_data = upload_response.json()
+    media_id = upload_response.json().get("media_id_string")
+    if not media_id:
+        return jsonify({"error": "No media_id returned from Twitter"}), 400
 
-    if upload_response.status_code != 200 or 'media_id_string' not in upload_data:
-        return jsonify({"error": "Media upload failed", "details": upload_data}), 400
-
-    media_id = upload_data['media_id_string']
-
-    # Step 2: Post tweet with media
-    tweet_text = request.form.get('text', 'This is a test tweet with an image!')
-    tweet_url = "https://api.twitter.com/2/tweets"
-    tweet_headers = {
-        'Content-Type': 'application/json'
-    }
-    tweet_payload = {
-        'text': tweet_text,
-        'media': {
-            'media_ids': [media_id]
-        }
-    }
-
-    tweet_response = oauth.post(tweet_url, json=tweet_payload, headers=tweet_headers)
-    # tweet_data = tweet_response.json() use later for getting tweet id or something
-
+    # Step 4: Create the tweet with the uploaded media
+    tweet_response = oauth.post(
+        "https://api.twitter.com/2/tweets",
+        json={"text": tweet_text, "media": {"media_ids": [media_id]}},
+        headers={"Content-Type": "application/json"}
+    )
     if tweet_response.status_code == 201:
-        flash("Tweet posted successfully!", "success")
         tweet_data = tweet_response.json()
         tweet_id = tweet_data["data"]["id"]
         save_tweet_id(tweet_id)
-    else:
-        flash("Failed to post tweet.", "error")
+        return jsonify({"success": True, "tweet_id": tweet_id, "image_url": image_url}), 201
 
-    return redirect(url_for('home'))
-
-
-def get_tweet_data(tweet_id):
-    api_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=token"
-    try:
-        response = requests.get(api_url)
-        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
-        tweet_data = response.json()
-
-        # Check if essential fields are present, else consider it an incomplete or deleted tweet
-        if "id_str" in tweet_data and "user" in tweet_data and "favorite_count" in tweet_data:
-            return {
-                "id": tweet_data["id_str"],
-                "name": tweet_data["user"]["name"],
-                "favorite_count": tweet_data.get("favorite_count", 0)
-            }
-        else:
-            # If required fields are missing, log a message and skip this tweet
-            print(f"Incomplete tweet data for ID {tweet_id}, skipping.")
-            return None
-    except requests.exceptions.RequestException as e:
-        # Log the error and skip this tweet if there’s a request error
-        print(f"Error fetching data for tweet ID {tweet_id}: {e}")
-        return None
+    return jsonify({"error": "Failed to post tweet", "details": tweet_response.json()}), 400
 
 
-# Route to render the dashboard data
 @app.route('/twitter-image/dashboard')
 def dashboard():
-    tweets = []
+    leaderboard = []
     if os.path.exists(TWEETS_FILE):
         with open(TWEETS_FILE, 'r') as file:
             tweets_data = json.load(file)
             for tweet in tweets_data["tweets"]:
                 tweet_info = get_tweet_data(tweet["id"])
                 if tweet_info:
-                    tweets.append(tweet_info)
-    return jsonify(tweets)
+                    leaderboard.append(tweet_info)
+
+    # Sort leaderboard by likes (descending)
+    leaderboard.sort(key=lambda x: x["likes"], reverse=True)
+    return jsonify({"items": leaderboard})
 
 
-TWEETS_FILE = 'tweets.json'
+def get_tweet_data(tweet_id):
+    api_url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token=token"
+    try:
+        response = requests.get(api_url)
+        response.raise_for_status()
+        tweet_data = response.json()
+
+        # Extract media URL from `entities.media` or `mediaDetails`
+        media_url = (
+            tweet_data.get("entities", {}).get("media", [{}])[0].get("media_url_https") or
+            tweet_data.get("mediaDetails", [{}])[0].get("media_url_https", "")
+        )
+        # Check for required fields
+        if all(field in tweet_data for field in ["id_str", "user"]):
+            return {
+                "id": tweet_data["id_str"],
+                "author": tweet_data["user"]["name"],
+                "prompt": tweet_data.get("text", ""), 
+                "imageUrl": media_url, 
+                "likes": tweet_data.get("favorite_count", 0),
+                "socialMediaLink": f"https://twitter.com/{tweet_data['user']['screen_name']}/status/{tweet_id}"
+            }
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching data for tweet ID {tweet_id}: {e}")
+    return None
 
 
 def save_tweet_id(tweet_id):
@@ -165,14 +191,31 @@ def save_tweet_id(tweet_id):
         json.dump(tweets_data, file, indent=2)
 
 
-def get_all_tweet_ids():
-    # Read all tweet IDs from the JSON file
-    if os.path.exists(TWEETS_FILE):
-        with open(TWEETS_FILE, 'r') as file:
-            tweets_data = json.load(file)
-        return [tweet["id"] for tweet in tweets_data["tweets"]]
-    return []
+def validate_jwt(auth_header):
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise ValueError("Authorization token is missing or invalid")
+    try:
+        # Extract and decode the JWT
+        jwt_token = auth_header.split(" ")[1]
+        decoded_token = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        
+        # Extract OAuth tokens from the decoded JWT
+        oauth_token = decoded_token.get("oauth_token")
+        oauth_token_secret = decoded_token.get("oauth_token_secret")
+        if not oauth_token or not oauth_token_secret:
+            raise ValueError("Invalid token")
+        
+        return oauth_token, oauth_token_secret
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError) as e:
+        raise ValueError(f"Invalid or expired token: {str(e)}")
 
+
+def download_image(image_url):
+    # Send a GET request to download the image
+    response = requests.get(image_url)
+    if response.status_code != 200:
+        raise ValueError("Failed to download image")
+    return BytesIO(response.content)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
