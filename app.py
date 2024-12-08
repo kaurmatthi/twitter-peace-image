@@ -7,13 +7,17 @@ from flask import Flask, redirect, url_for, session, request, render_template, j
 from flask_cors import CORS
 from requests_oauthlib import OAuth1Session
 import jwt
+import openai
 
+# Set OpenAI API key
+openai.api_key = ''
+
+# Flask app setup with CORS support, session security and JWT configuration
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173"], supports_credentials=True, methods=["GET", "POST", "OPTIONS"])
 app.secret_key = 'your_secret_key'
 JWT_SECRET = "your_jwt_secret_key"
 JWT_ALGORITHM = "HS256"
-TWEETS_FILE = 'tweets.json'
 
 # Twitter API credentials for OAuth 1.0
 CONSUMER_KEY = ''
@@ -21,6 +25,9 @@ CONSUMER_SECRET = ''
 REQUEST_TOKEN_URL = 'https://api.twitter.com/oauth/request_token'
 AUTHORIZATION_URL = 'https://api.twitter.com/oauth/authorize'
 ACCESS_TOKEN_URL = 'https://api.twitter.com/oauth/access_token'
+
+# File to store tweet IDs
+TWEETS_FILE = 'tweets.json'
 
 @app.route('/twitter-image/')
 def home():
@@ -79,11 +86,19 @@ def generate_image():
         prompt = request_data.get("prompt")
         if not prompt:
             return jsonify({"error": "Prompt is required"}), 400
-        
-        # TODO: Replace mock_image_url with DALL-E generated image
-        mock_image_url = "https://www.voicesofyouth.org/sites/voy/files/images/2021-09/voices_of_the_youth_images_0.jpg"
 
-        return jsonify({"imageUrl": mock_image_url}), 200
+        # Use the OpenAI Image API to generate an image
+        response = openai.Image.create(
+            prompt=prompt,
+            n=1,
+            size="1024x1024",
+            model="dall-e-3"
+        )
+
+        # Extract the URL of the generated image
+        generated_image_url = response['data'][0]['url']
+
+        return jsonify({"imageUrl": generated_image_url}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
@@ -97,9 +112,11 @@ def post_image_tweet():
     # Step 2: Parse request data
     request_data = request.get_json()
     image_url = request_data.get("imageUrl")
-    tweet_text = "This is a test tweet!"  # TODO: Maybe let's include user's prompt?
+    tweet_text = request_data.get("prompt")
     if not image_url:
         return jsonify({"error": "imageUrl is required"}), 400
+    if not tweet_text:
+        return jsonify({"error": "prompt is required"}), 400
 
     # Step 3: Upload the image to Twitter
     oauth = OAuth1Session(
@@ -117,7 +134,7 @@ def post_image_tweet():
     if not media_id:
         return jsonify({"error": "No media_id returned from Twitter"}), 400
 
-    # Step 4: Create the tweet with the uploaded media
+    # Step 4: Create the tweet with the uploaded media and user prompt
     tweet_response = oauth.post(
         "https://api.twitter.com/2/tweets",
         json={"text": tweet_text, "media": {"media_ids": [media_id]}},
@@ -174,6 +191,8 @@ def get_tweet_data(tweet_id):
         print(f"Error fetching data for tweet ID {tweet_id}: {e}")
     return None
 
+
+TWEETS_FILE = 'tweets.json'
 
 def save_tweet_id(tweet_id):
     # Load existing tweet data from the file
